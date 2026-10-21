@@ -50,6 +50,7 @@ docker buildx build --platform linux/amd64 -f user-service/Dockerfile -t user-se
 docker buildx build --platform linux/amd64 -f order-service/Dockerfile -t order-service:latest . --load
 docker buildx build --platform linux/amd64 -f wishlist-service/Dockerfile -t wishlist-service:latest . --load
 docker buildx build --platform linux/amd64 -f payment-service/Dockerfile -t payment-service:latest . --load
+docker buildx build --platform linux/amd64 -f cart-service/Dockerfile -t cart-service:latest . --load
 ```
 
 ### 4️⃣ Docker Compose로 컨테이너 실행
@@ -75,10 +76,11 @@ docker-compose up --build -d
 - 위시리스트 조회 및 관리
 - 상품 목록 및 상세 페이지 제공
 ### 📌 주문 및 결제
-- 분산 락 기반 동시성 제어로 정확한 주문 처리
-- Kafka 이벤트 드리븐 아키텍처 기반 비동기 결제 처리
-- 주문 상태 실시간 추적 (결제 중, 배송 중, 배송 완료 등)
-- 주문 취소 및 환불 처리
+- Redis Lua 스크립트 기반 원자적 재고 차감으로 정확한 주문 처리
+- Kafka 이벤트 드리븐 아키텍처(SAGA + Outbox) 기반 비동기 주문·결제 처리
+- 장바구니 기반 다중 상품 주문
+- 주문 상태 추적 (주문 접수, 재고 예약, 주문 완료, 배송 중, 배송 완료 등)
+- 주문 취소 및 반품 처리
 
 ### 📌 모니터링 및 장애 관리
 - Prometheus + Grafana 기반 실시간 모니터링
@@ -86,9 +88,10 @@ docker-compose up --build -d
 - Retry 패턴으로 일시적 장애 자동 복구
 
 ## 💻 기술 스택
-- Backend : JAVA 21, Spring Boot 3.3.6, Spring Security, Spring Data JPA, Spring Cloud Netflix Eureka Client, JWT, CircuitBreaker
-- Database : MySQL, Redis, DBeaver, Kafka
-- Test Tool : Postman, K6, JUnit
+- Backend : JAVA 21, Spring Boot 3.3.6, Spring Security, Spring Data JPA, QueryDSL, Spring Cloud Netflix Eureka Client, Spring Cloud Gateway, OpenFeign, JWT, Resilience4j
+- Database : MySQL, Redis, DBeaver
+- Message Broker : Kafka
+- Test Tool : Postman, K6, JUnit, Mockito, Testcontainers
 - DevOps : Docker, Git, Prometheus, Grafana
 - ETC : InteliJ, Google SMTP
 
@@ -141,7 +144,7 @@ MySQL은 데이터의 일관성을 유지하고 핵심 데이터를 안정적으
     <br><br>
     대규모 트래픽 상황에서 자주 조회되는 재고 정보를 캐싱하여 데이터베이스 접근을 줄이고 빠른 응답 속도를 보장할 수 있었습니다. 
     <br><br>
-    또한, Redis의 분산 락 기능을 활용해 동시성 제어 문제를 해결하였으며, 간단한 구현과 뛰어난 성능 덕분에 효율적으로 동시성 문제를 처리할 수 있었습니다. Redis는 읽기 요청을 처리하고 MySQL은 쓰기 작업을 담당하도록 설계하여, 데이터 일관성과 성능의 균형을 유지했습니다.
+    또한, 초기에는 Redisson 분산 락으로 동시성을 제어했으나, 선착순 상황에서 하나의 상품 키에 요청이 집중되며 락 경합이 커지는 문제가 있어 Lua 스크립트 기반 원자적 재고 차감으로 전환했습니다. Redis가 단일 스레드로 스크립트를 실행하는 특성을 활용해 조회·검증·차감을 락 없이 한 번의 왕복으로 처리할 수 있었습니다.
 </details>
 
 <details>
@@ -176,7 +179,7 @@ WhiteMonday 프로젝트에서는 사용자의 주문 요청이 들어오면, �
 
 또한, 각 서비스가 독립적인 DB를 사용하는 MSA 구조에서 단일 트랜잭션으로 묶어 처리할 수 없기 때문에 데이터 일관성 보장이 어려운 상황이었습니다.<br>
 
-Kafka 기반 비동기 메시징 도입과 SAGA 패턴 적용을 통한 분산 트랜잭션 보상 처리를 적용하여 전체 요청 처리 시간을 동기 구조 대비 대폭 단축시키고, 서비스 간의 느슨한 결합을 유지하면서도 데이터 정합성 확보와 대용량 주문 요청에 대해 확장성과 장애 대응력 확보하였습니다.
+Kafka 기반 비동기 메시징 도입과 SAGA(Orchestration) 패턴 적용을 통한 분산 트랜잭션 보상 처리를 적용하여, 주문 API가 재고·결제 처리를 기다리지 않고 응답하도록 분리하였습니다. 또한 Outbox 패턴으로 DB 저장과 이벤트 발행 사이의 유실을 막고, 멱등성 처리로 중복 이벤트를 방지하여 서비스 간의 느슨한 결합을 유지하면서도 데이터 정합성과 장애 대응력을 확보하였습니다.
 <br>
 </details>
 
@@ -226,7 +229,7 @@ MSA 환경에서 특정 서비스가 일시적으로 장애를 겪거나 응답 
 
 **[Issues]**
 - **DB 병목 발생**: 재고 데이터를 MySQL에서 직접 조회하면서 트래픽 증가 시 데이터베이스 I/O 부하 급증
-- **대규모 트래픽 성능 저하**: 트래픽 증가 시 평균 응답시간 응답시간 1.27초 기록 → 사용자 이탈 우려
+- **대규모 트래픽 성능 저하**: 트래픽 증가 시 평균 응답시간 1.27초 기록 → 사용자 이탈 우려
 - **수평적 확장(Scale-Out) 제약**: 단일 데이터베이스 구조로 인한 확장성 한계
 - **[Before] 성능 테스트 결과**:
     - **TPS**: 182.85/sec
@@ -237,10 +240,10 @@ MSA 환경에서 특정 서비스가 일시적으로 장애를 겪거나 응답 
 2. **Redis 캐싱** : 응답이 빠르고 DB 부하가 감소하지만 캐시-DB 불일치 가능성
 3. **Redis + CDC** : 완벽한 동기화지만 구현 복잡도가 높으며 운영 비용에 부담이 생김
 
-**[Choice] Redis Cache-Aside + Write-Through**
+**[Choice] Redis Cache-Aside + 재고 선적재**
 - **Cache-Aside 패턴**: 자주 조회되는 재고 데이터를 Redis에 저장. 캐시 미스 발생 시 DB에서 조회 후 캐시 업데이트
-- **Write-Through 패턴**: DB와 Redis에 동기적으로 업데이트하여 데이터 일관성 보장
-- **동적 TTL 전략**: 재고 수량에 따라 캐시 만료 시간 차등 적용으로 실시간성 확보
+- **재고 선적재(Pre-warm)**: 상품 등록 시 재고를 Redis에 미리 적재하여 오픈 직후 캐시 미스 방지
+- **CDC 제외 이유**: Debezium 등 추가 인프라 운영 부담 대비 1인 프로젝트 규모에서 이점이 적다고 판단
 
 **[Solve]**:
 - `RedisTemplate`을 사용해 Cache-Aside 전략으로 데이터 캐싱.
@@ -264,22 +267,26 @@ MSA 환경에서 특정 서비스가 일시적으로 장애를 겪거나 응답 
 2. **FeignClient @Async 방식** : 비동기 응답 방식이 장점이지만 트랜잭션 관리가 복잡하며 실패 추적이 어려움
 3. **Kafka 비동기 방식** : 완전한 장애 격리가 가능하고 확장성이 좋지만 구현 복잡도 높으며 이벤트 유실 가능성 있음
 
-**[Choice] Kafka 비동기 방식 (Kafka +SAGA 구조)**
+**[Choice] Kafka 비동기 방식 (Kafka + SAGA 구조)**
 
-**[SAGA 패턴 + Choreography 방식]**
+**[SAGA 패턴 + Orchestration 방식]**
 - **분산 트랜잭션 관리**: 각 서비스가 로컬 트랜잭션 실행 후 이벤트 발행
-- **보상 트랜잭션**: 실패 시 이전 단계 롤백 이벤트 발행
-- **Choreography 방식 선택**: 중앙 오케스트레이터 제거로 단일 장애 지점(SPOF) 방지하고 서비스 간 결합도를 최소화하여 독립 배포 및 확장성 확보
+- **보상 트랜잭션**: 실패 시 이전 단계 롤백 이벤트(재고 복구) 발행
+- **Orchestration 방식 선택**: order-service의 SagaOrchestrator가 재고·결제 결과를 받아 다음 단계를 결정하여, 다중 상품·보상 처리처럼 분기가 많은 흐름을 한 곳에서 추적 가능
 
 **[Outbox 패턴]**
 - 원자성 보장: 비즈니스 로직과 Outbox 저장을 같은 트랜잭션에서 처리
-- 이벤트 발행: @TransactionalEventListener(afterCommit)로 트랜잭션 커밋 후 Kafka 발행
-- 실패 복구: Outbox 상태 관리로 발행 실패 시 재시도 가능
+- 이벤트 발행: 스케줄러가 커밋된 PENDING 이벤트를 주기적으로 조회해 Kafka로 발행 (Polling Publisher)
+- 실패 복구: Outbox 상태(PENDING / PUBLISHED / FAILED) 관리로 발행 실패 시 재시도, 발행 완료 이벤트는 Cleanup 스케줄러로 정리
+
+**[멱등성 + DLQ]**
+- 중복 방지: Kafka at-least-once 전달로 인한 중복 이벤트를 처리 이벤트 ID 테이블(ProcessedEvent)로 걸러 재고 이중 차감·복구 방지
+- 실패 추적: 재고 복구 등 보상 이벤트 처리 실패 시 DLQ 테이블에 원본 이벤트 저장
 
 **[Solve]**:
-- 주문 생성 시 Kafka의 order-created-topic에 이벤트 발행
-- 결제 서비스는 해당 이벤트를 비동기적으로 수신 후 결제 처리
-- 결제 성공/실패 결과를 다시 이벤트로 발행하여 이후 단계(재고 감소 또는 보상 처리) 진행
+- 주문 생성 시 상품별 재고 예약 요청 이벤트를 Outbox에 저장 후 stock-reservation-requested-topic으로 발행
+- 모든 상품의 재고 예약이 완료된 경우에만 결제 요청 이벤트 발행, 하나라도 실패하면 주문 취소 및 예약 재고 복구
+- 결제 성공/실패 결과를 다시 이벤트로 발행하여 이후 단계(주문 완료 또는 보상 처리) 진행
 
 - **[Outcomes]**:
     - 각 서비스 간 느슨한 결합 → 장애 전파 최소화.
@@ -305,24 +312,24 @@ MSA 환경에서 특정 서비스가 일시적으로 장애를 겪거나 응답 
 
 **[Choice] Resilience4j Circuit Breaker + Retry + Prometheus/Grafana 모니터링**
 - **장애 격리**: 결제 서비스 다운 시에도 주문 접수 가능
-- **자원 절약**: 불필요한 호출 차단으로 CPU 사용률 30% 감소
+- **자원 절약**: 장애 서비스로의 불필요한 호출 차단으로 스레드·커넥션 고갈 방지
 - **사용자 경험**: 즉시 Fallback 응답으로 대기 시간 제거
 - **실시간 모니터링**: 장애 조기 감지 및 빠른 대응
 
 **[Solve]**
 
 **1. Resilience4j의 CircuitBreaker**
-- 외부 서비스 호출 실패율이 50% 초과 시 자동으로 회로 차단
+- 서비스 특성에 따라 실패율 임계치 차등 적용 (결제 40%, 장바구니 50%, 주문 60%) 초과 시 자동으로 회로 차단
 - Half-Open 상태에서 시험 요청으로 서비스 복구 여부 확인
 - Closed 상태로 복구 시 정상 요청 재개
 
 **2. Fallback 메서드 구현**
-- 결제 서비스 장애 시 주문을 "결제 대기" 상태로 보관 후 복구 시 재처리
-- 재고 서비스 장애 시: 캐시된 재고 정보로 임시 응답
+- 장바구니 등 하위 서비스 장애 시: 대기 없이 즉시 안내 응답 반환
+- Redis 장애 시: 재고 조회·차감을 DB로 우회 처리
 
 **3. Retry 패턴 조합**
-- 일시적 네트워크 오류는 3회까지 자동 재시도
-- 3회 실패 후 Circuit Breaker 작동
+- 일시적 네트워크 오류는 지수 백오프로 3회까지 자동 재시도
+- 재시도 실패가 누적되어 실패율 임계치를 넘으면 Circuit Breaker 작동
 
 **4. Prometheus + Grafana 모니터링 강화**
 - Prometheus 주요 메트릭
@@ -332,27 +339,27 @@ MSA 환경에서 특정 서비스가 일시적으로 장애를 겪거나 응답 
     - Retry 횟수
 
 - Grafana 대시보드 구성
-    - 실패율 30% 초과 시 경고(Alert)
-    - Circuit Breaker Open 전환 시 즉시 알림
+    - Circuit Breaker 상태, 실패율, 응답 시간 시각화
+    - 5xx 에러율 임계치 초과 시 경고(Alert)
 
 **[Outcomes]**
-- **장애 감지 시간 단축**: 장애 인지까지 평균 10분 → 1~2분
+- **장애 감지 시간 단축**: 수동 로그 탐색 대신 대시보드 지표로 장애 상태 즉시 확인
 - **장애 전파 차단**: 결제 서비스 다운 시에도 주문 서비스 가용성 유지
 - **응답 실패율 감소**: 타임아웃 오류 Fallback 처리
-- **시스템 복원력 향상**: 평균 복구 시간 15분 → 2분
+- **시스템 복원력 향상**: 일시적 오류는 Retry로 자동 복구, 지속 장애는 회로 차단 후 Half-Open으로 자동 복귀
 - **사용자 경험**: 장애 상황에서도 부분 기능 제공으로 완전 실패 방지
 - **운영 가시성 확보**: 장애 원인(네트워크 / 타임아웃 / 외부 서비스)을 메트릭 기반으로 즉시 식별 가능
 ---
 
 ## ✅ 프로젝트 향후 개선 방안
 
-### 1. 🔍 QueryDSL 도입으로 쿼리 최적화
+### 1. 🔍 QueryDSL 도입으로 쿼리 최적화 (✔ 3차 MVP 적용 완료)
 
-- **[현재]**  
-  복잡한 조건이나 동적 검색 쿼리를 JPQL 또는 Native Query로 직접 작성하고 있음
+- **[이전]**  
+  복잡한 조건이나 동적 검색 쿼리를 JPQL 또는 Native Query로 직접 작성
 
-- **[이후]**  
-  QueryDSL을 도입하여 가독성 높은 동적 쿼리 구성 및 재사용 가능한 조건 빌더 패턴 적용 예정
+- **[적용]**  
+  QueryDSL을 도입하여 주문·상품 조회에 가독성 높은 동적 쿼리 구성 및 검색 조건 객체(ProductSearchCondition, OrderSearchCondition) 패턴 적용
 
 - **[기대효과]**
     - JPA의 정적 쿼리 한계를 보완하고, 유지보수성과 테스트 편의성 향상
@@ -380,7 +387,7 @@ MSA 환경에서 특정 서비스가 일시적으로 장애를 겪거나 응답 
   서비스 간 호출 흐름 추적 어려움 → 로그를 수동으로 추적 중
 
 - **[이후]**  
-  Spring Sleuth + Zipkin을 연동하여 호출 흐름 시각화 및 추적 시스템 구축
+  Micrometer Tracing + Zipkin을 연동하여 (Spring Boot 3에서는 Sleuth 미지원) 호출 흐름 시각화 및 추적 시스템 구축
 
 - **[기대효과]**
     - 장애 발생 위치 및 전파 지점을 빠르게 파악 가능
